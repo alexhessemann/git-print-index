@@ -1,5 +1,3 @@
-// Documentation of git's index file format: https://git-scm.com/docs/index-format
-
 #include <arpa/inet.h>
 #include <assert.h>
 #include <grp.h>
@@ -14,6 +12,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+
 
 struct header {
 	char signature[4];
@@ -58,51 +57,75 @@ struct tree {
 
 struct ctx {
 	FILE *file;
+	long file_pos; // ftell doesn't work on FIFOs, so we need to maintain our position ourselves.
 	// From the header
 	uint32_t version;
 	uint32_t entry_count;
 };
 
-// Should return the same as fstrchr( a_file, 0 )
-// NOT compatible with a FIFO
-size_t get_stringz_len( FILE *a_file )
-{
-	size_t len = 0;
-	size_t part_len;
-	long pos = ftell( a_file );
-	char buffer[257];
-	buffer[256] = 0;
-	do {
-		// Issue if file ends before a \0 is found.
-		fread( buffer, 1, 256, a_file );
-		part_len = strlen( buffer );
-		len += part_len;
-	} while (part_len == 256);
 
-	fseek( a_file, pos, SEEK_SET );
-	
-	return len;
+void seek( struct ctx *a_ctx, long a_offset )
+{
+	char buffer[4096];
+
+	while (a_offset >= 4096) {
+		size_t read = fread( buffer, 1, 4096, a_ctx->file );
+		a_offset -= read;
+		a_ctx->file_pos += read;
+	}
+	if (a_offset) {
+		a_ctx->file_pos += fread( buffer, 1, a_offset, a_ctx->file );
+	}
 }
 
-// Returns the length before finding c
-size_t fstrchr( FILE *a_file, int c )
-{
-	size_t len = 0;
-	size_t part_len;
-	long pos = ftell( a_file );
-	char buffer[256];
-	do {
-		// Issue if file ends before c is found.
-		fread( buffer, 1, 256, a_file );
-		char *result = memchr( buffer, c, 256 );
-		part_len = result ? result - buffer : 256;
-		len += part_len;
-	} while (part_len == 256);
 
-	fseek( a_file, pos, SEEK_SET );
+ssize_t alloc_string( int a_char, FILE * a_file, char ** a_string )
+{
+	assert( a_char == EOF || (a_char >=0 && a_char <= 255) );
+	assert( a_file );
+	assert( a_string );
+
+	char *buffer = NULL;
+	size_t buf_len = 0;
+	size_t buf_used = 0;
+	int next_char;
+
+	do {
+		if (buf_used >= buf_len) {
+			buf_len += 4096;
+			char *upd_buffer = realloc( buffer, buf_len );
+			if (!upd_buffer) {
+				perror( "realloc" );
+				free( buffer );
+			}
+			buffer = upd_buffer;
+		}
+		if (buffer) {
+			next_char = fgetc( a_file );
+			if (next_char == a_char) {
+				buffer[buf_used++] = 0;
+			} else if (next_char < 0) { // EOF
+				fprintf( stderr, "Unexpected end of file while scanning string.\n" );
+				free( buffer );
+				buffer = NULL;
+			} else {
+				buffer[buf_used++] = next_char;
+			}
+		}
+	} while (buffer && next_char != a_char);
+
+	if (buffer) {
+			char *upd_buffer = realloc( buffer, buf_used );
+			if (upd_buffer) buffer = upd_buffer;
+			// else keep the bigger-than-needed buffer
+	}
+
+	*a_string = buffer;
 	
-	return len;
+	// Return the size as strlen would, not counting the final \0.
+	return buffer ? buf_used - 1 : -1;
 }
+
 
 void print_hex_string( size_t a_len, const void *a_ptr )
 {
@@ -113,35 +136,30 @@ void print_hex_string( size_t a_len, const void *a_ptr )
 	}
 }
 
-void pretty_read_tree( FILE * a_file, long a_endpos, int a_level, bool a_last, const char * tree_str )
+
+void pretty_read_tree( struct ctx *a_ctx, long a_endpos, int a_level, bool a_last, const char * tree_str )
 {
-	if (ftell( a_file ) >= a_endpos) {
+	if (a_ctx->file_pos >= a_endpos) {
 		if (a_level > 0) {
 			fprintf( stderr, "Incomplete tree\n" );
 		} // else parsing finished
 	} else {
 		struct tree tree;
-		size_t len;
 		char *entry_count;
 		char *subtrees;
 		char *new_tree_str;
 
-		len = get_stringz_len( a_file );
-		tree.path = malloc( len + 1 );
-		fread( tree.path, 1, len + 1, a_file );
-		len = fstrchr( a_file, ' ' );
-		entry_count = malloc( len + 2 );
-		entry_count[len + 1] = 0;
-		fread( entry_count, 1, len + 1, a_file );
-		len = fstrchr( a_file, '\n' );
-		subtrees = malloc( len + 2 );
-		subtrees[len + 1] = 0;
-		fread( subtrees, 1, len + 1, a_file );
+		a_ctx->file_pos += alloc_string( '\0', a_ctx->file, &tree.path ) + 1;
+
+		a_ctx->file_pos += alloc_string( ' ', a_ctx->file, &entry_count ) + 1;
+
+		a_ctx->file_pos += alloc_string( '\n', a_ctx->file, &subtrees ) + 1;
+
 		tree.entry_count = atoi( entry_count );
 		tree.subtrees = atoi( subtrees );
 
 		if (tree.entry_count >= 0) {
-			fread( tree.sha1, 1, 20, a_file );
+			a_ctx->file_pos += fread( tree.sha1, 1, 20, a_ctx->file );
 			print_hex_string( 20, tree.sha1 );
 		} else {
 			printf( "                                        " );
@@ -165,46 +183,37 @@ void pretty_read_tree( FILE * a_file, long a_endpos, int a_level, bool a_last, c
 
 		if (tree.subtrees > 0) {
 			for (int i=0; i < tree.subtrees - 1; i++) {
-				pretty_read_tree( a_file, a_endpos, a_level + 1, false, new_tree_str );
+				pretty_read_tree( a_ctx, a_endpos, a_level + 1, false, new_tree_str );
 			}
-			pretty_read_tree( a_file, a_endpos, a_level + 1, true, new_tree_str );
+			pretty_read_tree( a_ctx, a_endpos, a_level + 1, true, new_tree_str );
 		}
 	}
 }
 
-void read_tree( FILE * a_file, long a_endpos )
+void read_tree( struct ctx *a_ctx, long a_endpos )
 {
-	while (ftell( a_file ) < a_endpos ) {
+	while (a_ctx->file_pos < a_endpos ) {
 		struct tree tree;
-		size_t len = get_stringz_len( a_file );
-		tree.path = malloc( len + 1 );
-		fread( tree.path, 1, len + 1, a_file );
+
+		a_ctx->file_pos += alloc_string( '\0', a_ctx->file, &tree.path ) + 1;
+
 		printf( "Path: '%s'\n", tree.path );
 		char *entry_count, *subtrees;
-		// %m doesn't work on macOS (as of Xcode 11.6)
-		len = fstrchr( a_file, ' ' );
-		entry_count = malloc( len + 2 );
-		entry_count[len + 1] = 0;
-		fread( entry_count, 1, len + 1, a_file );
-		len = fstrchr( a_file, '\n' );
-		subtrees = malloc( len + 2 );
-		subtrees[len + 1] = 0;
-		fread( subtrees, 1, len + 1, a_file );
-//		fscanf( a_file, "%m[0-9] %m[0-9]", &entry_count, &subtrees );
+
+		a_ctx->file_pos += alloc_string( ' ', a_ctx->file, &entry_count ) + 1;
+
+		a_ctx->file_pos += alloc_string( '\n', a_ctx->file, &subtrees ) + 1;
+
 		tree.entry_count = atoi( entry_count );
 		tree.subtrees = atoi( subtrees );
 		printf( "Entry count: %d, subtrees: %u\n", tree.entry_count, tree.subtrees );
-/*		int lf = fgetc( a_file );
-		if (lf != '\n' ) {
-			printf( "Unexpected byte\n" );
-		}*/
-		fread( tree.sha1, 1, 20, a_file );
+		a_ctx->file_pos += fread( tree.sha1, 1, 20, a_ctx->file );
 		printf( "Object name: " );
 		print_hex_string( 20, tree.sha1 );
 		printf( "\n\n" );
-//		printf( "\n%ld bytes remaining\n\n", endpos - ftell( a_file ) );
+//		printf( "\n%ld bytes remaining\n\n", endpos - a_ctx->file_pos );
 	}
-	if (ftell( a_file ) > a_endpos) {
+	if (a_ctx->file_pos > a_endpos) {
 		printf( "We read too much\n" );
 	}
 }
@@ -254,6 +263,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 {
 	size_t result = fread( entry, 1, 62, a_ctx->file );
 	if (result == 62) {
+		a_ctx->file_pos += result;
 		entry->ctime = ntohl( entry->ctime );
 		entry->ctime_ns = ntohl( entry->ctime_ns );
 		entry->mtime = ntohl( entry->mtime );
@@ -266,23 +276,19 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 		entry->file_size = ntohl( entry->file_size );
 		entry->flags = ntohs( entry->flags );
 
-		entry->file_name_len = get_stringz_len( a_ctx->file );
-		entry->file_name = malloc( entry->file_name_len + 1 );
+		entry->file_name_len = alloc_string( '\0', a_ctx->file, &entry->file_name );
+		a_ctx->file_pos += entry->file_name_len + 1;
+
 		if (entry->file_name) {
-			result = fread( entry->file_name, 1, entry->file_name_len + 1, a_ctx->file );
-			if (result == entry->file_name_len + 1) {
-				if (ftell( a_ctx->file ) % 8 != 4) {
-					entry->pad_bytes_len = 8 - ((ftell( a_ctx->file ) - 4) % 8);
-					entry->pad_bytes = malloc( entry->pad_bytes_len ); // XXX: allocate and read with entry->file_name
-					fread( entry->pad_bytes, 1, entry->pad_bytes_len, a_ctx->file );
-				} else {
-					entry->pad_bytes_len = 0; // It should be possible to do better…
-				}
-				result = 0;
+			long file_pos = a_ctx->file_pos;
+			if (file_pos % 8 != 4) {
+				entry->pad_bytes_len = 8 - ((file_pos - 4) % 8);
+				entry->pad_bytes = malloc( entry->pad_bytes_len ); // XXX: allocate and read with entry->file_name
+				a_ctx->file_pos += fread( entry->pad_bytes, 1, entry->pad_bytes_len, a_ctx->file );
 			} else {
-				perror( "Reading index entry file name" );
-				result = 1;
+				entry->pad_bytes_len = 0; // It should be possible to do better…
 			}
+			result = 0;
 		} else {
 			perror( "Allocating index entry file name" );
 			result = 1;
@@ -470,7 +476,7 @@ int parse_header( struct ctx * a_ctx )
 {
 	int result = 0;
 	struct header header;
-	fread( &header, 1, 12, a_ctx->file );
+	a_ctx->file_pos += fread( &header, 1, 12, a_ctx->file );
 	a_ctx->version = ntohl( header.version );
 	a_ctx->entry_count = ntohl( header.entry_count );
 
@@ -487,22 +493,11 @@ int parse_header( struct ctx * a_ctx )
 
 int main( int argc, char * argv[] )
 {
-	struct ctx ctx;
+	struct ctx ctx = { NULL, 0, 0, 0 };
 	int result;
 
 	if (argc < 2) {
 		ctx.file = stdin;
-		// We need to check if this is a redirection or a pipe. Pipes are not currently supported.
-		struct stat statbuf;
-		result = fstat( fileno( ctx.file ), &statbuf );
-		if (result) {
-			perror( "Stat'ing stdin" );
-			return 1;
-		} else if (!S_ISREG( statbuf.st_mode )) {
-			fprintf( stderr, "stdin isn't a redirected regular file.\n" );
-			return 1;
-		}
-		
 	} else {
 		ctx.file = fopen( argv[1], "r" );
 		if (!ctx.file) {
@@ -523,55 +518,60 @@ int main( int argc, char * argv[] )
 	struct extension ext;
 
 	while (8 == fread( &ext, 1, 8, ctx.file )) {
+		ctx.file_pos += 8;
 		ext.len = ntohl( ext.len );
-		long endpos = ftell( ctx.file ) + ext.len;
+		long endpos = ctx.file_pos + ext.len;
 		switch (*((uint32_t*)ext.signature)) {
 		case 0x45455254: // TREE
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 #if PLAIN_TREE
-			read_tree( ctx.file, endpos );
+			read_tree( &ctx, endpos );
 #else
-			while (ftell( ctx.file ) < endpos ) {
-				pretty_read_tree( ctx.file, endpos, 0, true, "" );
+			while (ctx.file_pos < endpos ) {
+				pretty_read_tree( &ctx, endpos, 0, true, "" );
 			}
 			printf( "\n" );
 #endif
 			break;
 		case 0x43554552: // REUC
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "Resolve undo, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		case 0x6B6E696C: // link
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "Split index, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		case 0x52544E55: // UNTR
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "Untracked cache, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		case 0x4E4D5346: // FSMN
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "File system monitor cache, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		case 0x45494F45: // EOIE
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "End of index entry, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		case 0x544F4549: // IEOT
-			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ftell( ctx.file ), ftell( ctx.file ) );
+			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
 			printf( "Index entry offset table, skipping\n" );
-			fseek( ctx.file, ext.len, SEEK_CUR );
+			seek( &ctx, ext.len );
 			break;
 		default: {
 				// Assume hash
+				ext.len = htonl( ext.len ); // Reverses the byte-swap
 				char hash[20];
-				fseek( ctx.file, -8, SEEK_CUR );
-				fread( hash, 1, 20, ctx.file );
+				memcpy( hash, &ext, 8 );
+				result = fread( &hash[8], 1, 12, ctx.file );
+				if (result != 12) {
+					fprintf( stderr, "%d bytes read, 12 expected\n", result );
+				}
 				printf( "Hash checksum: " );
 				print_hex_string( 20, hash );
 				printf( "\n" );
