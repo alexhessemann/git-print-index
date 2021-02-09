@@ -8,10 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <time.h>
-#include <unistd.h>
 
 
 struct header {
@@ -58,6 +55,7 @@ struct tree {
 struct ctx {
 	FILE *file;
 	long file_pos; // ftell doesn't work on FIFOs, so we need to maintain our position ourselves.
+	SHA_CTX sha_ctx;
 	// From the header
 	uint32_t version;
 	uint32_t entry_count;
@@ -70,19 +68,27 @@ void seek( struct ctx *a_ctx, long a_offset )
 
 	while (a_offset >= 4096) {
 		size_t read = fread( buffer, 1, 4096, a_ctx->file );
+		SHA1_Update( &a_ctx->sha_ctx, buffer, 4096 );
 		a_offset -= read;
 		a_ctx->file_pos += read;
 	}
 	if (a_offset) {
 		a_ctx->file_pos += fread( buffer, 1, a_offset, a_ctx->file );
+		SHA1_Update( &a_ctx->sha_ctx, buffer, a_offset );
 	}
 }
 
 
-ssize_t alloc_string( int a_char, FILE * a_file, char ** a_string )
+// Allocates a NUL-terminated string read from the file in context,
+// with the provided char as a terminator, which can be EOF.
+// SHA1 context is updated with the original terminator.
+// Returns:
+//	- string length as strlen would, not counting the final \0.
+//	- (-1) when growing the buffer fails, or EOF is reached unexpectedly.
+ssize_t alloc_string( int a_char, struct ctx * a_ctx, char ** a_string )
 {
 	assert( a_char == EOF || (a_char >=0 && a_char <= 255) );
-	assert( a_file );
+	assert( a_ctx );
 	assert( a_string );
 
 	char *buffer = NULL;
@@ -91,6 +97,7 @@ ssize_t alloc_string( int a_char, FILE * a_file, char ** a_string )
 	int next_char;
 
 	do {
+		// Grow the buffer if needed
 		if (buf_used >= buf_len) {
 			buf_len += 4096;
 			char *upd_buffer = realloc( buffer, buf_len );
@@ -100,9 +107,16 @@ ssize_t alloc_string( int a_char, FILE * a_file, char ** a_string )
 			}
 			buffer = upd_buffer;
 		}
+
 		if (buffer) {
-			next_char = fgetc( a_file );
+			next_char = fgetc( a_ctx->file );
 			if (next_char == a_char) {
+				if (a_char == EOF) {
+					SHA1_Update( &a_ctx->sha_ctx, buffer, buf_used );
+				} else {
+					buffer[buf_used] = next_char;
+					SHA1_Update( &a_ctx->sha_ctx, buffer, buf_used + 1 );
+				}
 				buffer[buf_used++] = 0;
 			} else if (next_char < 0) { // EOF
 				fprintf( stderr, "Unexpected end of file while scanning string.\n" );
@@ -115,14 +129,13 @@ ssize_t alloc_string( int a_char, FILE * a_file, char ** a_string )
 	} while (buffer && next_char != a_char);
 
 	if (buffer) {
-			char *upd_buffer = realloc( buffer, buf_used );
-			if (upd_buffer) buffer = upd_buffer;
-			// else keep the bigger-than-needed buffer
+		char *upd_buffer = realloc( buffer, buf_used );
+		if (upd_buffer) buffer = upd_buffer;
+		// else keep the bigger-than-needed buffer
 	}
 
 	*a_string = buffer;
 	
-	// Return the size as strlen would, not counting the final \0.
 	return buffer ? buf_used - 1 : -1;
 }
 
@@ -137,6 +150,34 @@ void print_hex_string( size_t a_len, const void *a_ptr )
 }
 
 
+// Allocates a_tree->path
+void parse_tree_entry( struct ctx *a_ctx, struct tree * a_tree )
+{
+		ssize_t result;
+		char *entry_count;
+		char *subtrees;
+
+		result = alloc_string( '\0', a_ctx, &a_tree->path );
+		a_ctx->file_pos += result + 1;
+		result = alloc_string( ' ', a_ctx, &entry_count );
+		a_ctx->file_pos += result + 1;
+		result = alloc_string( '\n', a_ctx, &subtrees );
+		a_ctx->file_pos += result + 1;
+
+		a_tree->entry_count = atoi( entry_count );
+		a_tree->subtrees = atoi( subtrees );
+
+		free( entry_count );
+		free( subtrees );
+
+		if (a_tree->entry_count >= 0) {
+			result = fread( a_tree->sha1, 1, 20, a_ctx->file );
+			a_ctx->file_pos += result;
+			SHA1_Update( &a_ctx->sha_ctx, a_tree->sha1, result );
+		}
+}
+
+
 void pretty_read_tree( struct ctx *a_ctx, long a_endpos, int a_level, bool a_last, const char * tree_str )
 {
 	if (a_ctx->file_pos >= a_endpos) {
@@ -145,21 +186,11 @@ void pretty_read_tree( struct ctx *a_ctx, long a_endpos, int a_level, bool a_las
 		} // else parsing finished
 	} else {
 		struct tree tree;
-		char *entry_count;
-		char *subtrees;
 		char *new_tree_str;
 
-		a_ctx->file_pos += alloc_string( '\0', a_ctx->file, &tree.path ) + 1;
-
-		a_ctx->file_pos += alloc_string( ' ', a_ctx->file, &entry_count ) + 1;
-
-		a_ctx->file_pos += alloc_string( '\n', a_ctx->file, &subtrees ) + 1;
-
-		tree.entry_count = atoi( entry_count );
-		tree.subtrees = atoi( subtrees );
+		parse_tree_entry( a_ctx, &tree );
 
 		if (tree.entry_count >= 0) {
-			a_ctx->file_pos += fread( tree.sha1, 1, 20, a_ctx->file );
 			print_hex_string( 20, tree.sha1 );
 		} else {
 			printf( "                                        " );
@@ -180,6 +211,7 @@ void pretty_read_tree( struct ctx *a_ctx, long a_endpos, int a_level, bool a_las
 			new_tree_str = strdup( tree_str );
 		}
 		printf( "'%s', %d entries\n", tree.path, tree.entry_count );
+		free( tree.path );
 
 		if (tree.subtrees > 0) {
 			for (int i=0; i < tree.subtrees - 1; i++) {
@@ -195,23 +227,18 @@ void read_tree( struct ctx *a_ctx, long a_endpos )
 	while (a_ctx->file_pos < a_endpos ) {
 		struct tree tree;
 
-		a_ctx->file_pos += alloc_string( '\0', a_ctx->file, &tree.path ) + 1;
+		parse_tree_entry( a_ctx, &tree );
 
 		printf( "Path: '%s'\n", tree.path );
-		char *entry_count, *subtrees;
-
-		a_ctx->file_pos += alloc_string( ' ', a_ctx->file, &entry_count ) + 1;
-
-		a_ctx->file_pos += alloc_string( '\n', a_ctx->file, &subtrees ) + 1;
-
-		tree.entry_count = atoi( entry_count );
-		tree.subtrees = atoi( subtrees );
 		printf( "Entry count: %d, subtrees: %u\n", tree.entry_count, tree.subtrees );
-		a_ctx->file_pos += fread( tree.sha1, 1, 20, a_ctx->file );
-		printf( "Object name: " );
-		print_hex_string( 20, tree.sha1 );
-		printf( "\n\n" );
+		if (tree.entry_count >= 0) {
+			printf( "Object name: " );
+			print_hex_string( 20, tree.sha1 );
+			printf( "\n" );
+		}
+		printf( "\n" );
 //		printf( "\n%ld bytes remaining\n\n", endpos - a_ctx->file_pos );
+		free( tree.path );
 	}
 	if (a_ctx->file_pos > a_endpos) {
 		printf( "We read too much\n" );
@@ -244,8 +271,8 @@ void print_flags( uint16_t a_flags )
 {
 	// Merge stages:
 	// https://git-scm.com/book/en/v2/Git-Tools-Advanced-Merging
-	// 0: no merge (?) '-'
-	// 1: common ancestor 'c'
+	// 0: not in a merge conflict '-'
+	// 1: common ancestor 'c' / base
 	// 2: ours 'o'
 	// 3: theirs 't'
 	char merge;
@@ -263,6 +290,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 {
 	size_t result = fread( entry, 1, 62, a_ctx->file );
 	if (result == 62) {
+		SHA1_Update( &a_ctx->sha_ctx, entry, 62 );
 		a_ctx->file_pos += result;
 		entry->ctime = ntohl( entry->ctime );
 		entry->ctime_ns = ntohl( entry->ctime_ns );
@@ -276,7 +304,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 		entry->file_size = ntohl( entry->file_size );
 		entry->flags = ntohs( entry->flags );
 
-		entry->file_name_len = alloc_string( '\0', a_ctx->file, &entry->file_name );
+		entry->file_name_len = alloc_string( '\0', a_ctx, &entry->file_name );
 		a_ctx->file_pos += entry->file_name_len + 1;
 
 		if (entry->file_name) {
@@ -285,6 +313,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 				entry->pad_bytes_len = 8 - ((file_pos - 4) % 8);
 				entry->pad_bytes = malloc( entry->pad_bytes_len ); // XXX: allocate and read with entry->file_name
 				a_ctx->file_pos += fread( entry->pad_bytes, 1, entry->pad_bytes_len, a_ctx->file );
+				SHA1_Update( &a_ctx->sha_ctx, entry->pad_bytes, entry->pad_bytes_len );
 			} else {
 				entry->pad_bytes_len = 0; // It should be possible to do better…
 			}
@@ -477,6 +506,7 @@ int parse_header( struct ctx * a_ctx )
 	int result = 0;
 	struct header header;
 	a_ctx->file_pos += fread( &header, 1, 12, a_ctx->file );
+	SHA1_Update( &a_ctx->sha_ctx, &header, 12 );
 	a_ctx->version = ntohl( header.version );
 	a_ctx->entry_count = ntohl( header.entry_count );
 
@@ -493,7 +523,7 @@ int parse_header( struct ctx * a_ctx )
 
 int main( int argc, char * argv[] )
 {
-	struct ctx ctx = { NULL, 0, 0, 0 };
+	struct ctx ctx = { .file = NULL, .file_pos = 0, .version = 0, .entry_count = 0 };
 	int result;
 
 	if (argc < 2) {
@@ -505,6 +535,8 @@ int main( int argc, char * argv[] )
 			return 1;
 		}
 	}
+
+	SHA1_Init( &ctx.sha_ctx );
 
 	result = parse_header( &ctx );
 	if (result) return 1;
@@ -524,6 +556,8 @@ int main( int argc, char * argv[] )
 		switch (*((uint32_t*)ext.signature)) {
 		case 0x45455254: // TREE
 			printf( "Extension %.4s, length %u, content starting at offset %lu (0x%lX):\n", ext.signature, ext.len, ctx.file_pos, ctx.file_pos );
+			ext.len = ntohl( ext.len ); // Reverses the byte-swap
+			SHA1_Update( &ctx.sha_ctx, &ext, 8 );
 #if PLAIN_TREE
 			read_tree( &ctx, endpos );
 #else
@@ -565,6 +599,11 @@ int main( int argc, char * argv[] )
 			break;
 		default: {
 				// Assume hash
+				unsigned char md[20];
+				SHA1_Final( md, &ctx.sha_ctx );
+				printf( "Computed hash: " );
+				print_hex_string( 20, md );
+				printf( "\n" );
 				ext.len = htonl( ext.len ); // Reverses the byte-swap
 				char hash[20];
 				memcpy( hash, &ext, 8 );
