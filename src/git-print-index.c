@@ -17,11 +17,6 @@ struct header {
 	uint32_t entry_count;
 };
 
-struct extension {
-	char signature[4];
-	uint32_t len;
-};
-
 struct entry {
 	// ctime and mtime should be struct timespec as they correspond to stat(2) values.
 	// However struct timespec { time_t tv_sec; long tv_nsec; } are 64-bit fields 
@@ -39,9 +34,18 @@ struct entry {
 	uint16_t flags;
 	char * file_name; // 62th byte in v2
 	char * pad_bytes;
+	// v3
+	uint16_t extended_flags;
+	// v4
+	size_t prefix;
 	// Added members
 	size_t file_name_len;
 	size_t pad_bytes_len;
+};
+
+struct extension {
+	char signature[4];
+	uint32_t len;
 };
 
 struct tree {
@@ -76,6 +80,29 @@ void seek( struct ctx *a_ctx, long a_offset )
 		a_ctx->file_pos += fread( buffer, 1, a_offset, a_ctx->file );
 		SHA1_Update( &a_ctx->sha_ctx, buffer, a_offset );
 	}
+}
+
+
+ssize_t read_offset_delta( struct ctx * a_ctx )
+{
+	ssize_t offset = 0;
+	int next_char;
+	uint8_t buffer;
+	size_t byte_count = 0;
+
+	do {
+		next_char = fgetc( a_ctx->file );
+		buffer = next_char;
+		SHA1_Update( &a_ctx->sha_ctx, &buffer, 1 );
+		offset = (offset << 7) | (buffer & 0x7F);
+		byte_count++;
+	} while (next_char & 0x80);
+
+	for (size_t pow7 = 0x80; --byte_count; pow7<<=7) {
+		offset += pow7;
+	}
+
+	return offset;
 }
 
 
@@ -219,6 +246,7 @@ void pretty_read_tree( struct ctx *a_ctx, long a_endpos, int a_level, bool a_las
 			}
 			pretty_read_tree( a_ctx, a_endpos, a_level + 1, true, new_tree_str );
 		}
+		free( new_tree_str );
 	}
 }
 
@@ -286,6 +314,7 @@ void print_flags( uint16_t a_flags )
 }
 
 
+// Allocates entry->file_name
 int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 {
 	size_t result = fread( entry, 1, 62, a_ctx->file );
@@ -304,12 +333,22 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 		entry->file_size = ntohl( entry->file_size );
 		entry->flags = ntohs( entry->flags );
 
+		if (a_ctx->version >=3 && (entry->flags & 0x4000)) {
+			fread( &entry->extended_flags, 1, 2, a_ctx->file );
+			SHA1_Update( &a_ctx->sha_ctx, &entry->extended_flags, 2 );
+			entry->extended_flags = ntohs( entry->extended_flags );
+		}
+
+		if (a_ctx->version >= 4) {
+			entry->prefix = read_offset_delta( a_ctx );
+		}
+
 		entry->file_name_len = alloc_string( '\0', a_ctx, &entry->file_name );
 		a_ctx->file_pos += entry->file_name_len + 1;
 
 		if (entry->file_name) {
 			long file_pos = a_ctx->file_pos;
-			if (file_pos % 8 != 4) {
+			if (a_ctx->version < 4 && file_pos % 8 != 4) {
 				entry->pad_bytes_len = 8 - ((file_pos - 4) % 8);
 				entry->pad_bytes = malloc( entry->pad_bytes_len ); // XXX: allocate and read with entry->file_name
 				a_ctx->file_pos += fread( entry->pad_bytes, 1, entry->pad_bytes_len, a_ctx->file );
@@ -378,7 +417,11 @@ int parse_index_stat( struct ctx * a_ctx )
 		if (strlen( user_str ) > col_width[1]) col_width[1] = strlen( user_str );
 
 		printf( "Entry %u:\n", idx );
-		printf( "\t  File: %s\n\t    ID: ", entry.file_name );
+		printf( "\t  File: " );
+		if (a_ctx->version >= 4) {
+			printf( "[%zu] ", entry.prefix );
+		}
+		printf( "%s\n\t    ID: ", entry.file_name );
 		print_hex_string( 20, entry.sha1 );
 		printf( "\n\t  Size: %-*u %-*s %s\n", col_width[0], entry.file_size, col_width[1] + 7, flag_str, objtype );
 		printf( "\tDevice: %-*s Inode: %-*s\n", col_width[0], dev_str, col_width[1], ino_str );
@@ -397,6 +440,9 @@ int parse_index_stat( struct ctx * a_ctx )
 			printf("\tFilename length declared (%u) is different from the one computed (%zu)\n", entry.flags & 0x0FFF, entry.file_name_len );
 		}
 		printf( "\n" );
+
+		free( entry.file_name );
+		free( user_str );
 	}
 	return result;
 }
@@ -494,9 +540,14 @@ int parse_index_ls( struct ctx * a_ctx )
 		printf( " %*s %-*s %*u %s %s ", user_width, user_str, group_width, group_str, size_width, entry_p->file_size, ctimestr, mtimestr );
 		print_hex_string( 20, entry_p->sha1 );
 		printf( " %s\n", entry_p->file_name );
+
+		free( entry_p->file_name );
 	}
 	
 	putchar( '\n' );
+
+	free( entries );
+
 	return result;
 }
 
