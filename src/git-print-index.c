@@ -66,20 +66,46 @@ struct ctx {
 };
 
 
-void seek( struct ctx *a_ctx, long a_offset )
+int c_fgetc( struct ctx *a_ctx )
 {
-	char buffer[4096];
+	int result = fgetc( a_ctx->file );
+	if (result != EOF) {
+		char byte = result;
+		SHA1_Update( &a_ctx->sha_ctx, &byte, 1 );
+		a_ctx->file_pos++;
+	}
+	return result;
+}
 
-	while (a_offset >= 4096) {
-		size_t read = fread( buffer, 1, 4096, a_ctx->file );
-		SHA1_Update( &a_ctx->sha_ctx, buffer, 4096 );
-		a_offset -= read;
-		a_ctx->file_pos += read;
+
+size_t c_fread( void *a_ptr, size_t a_nmemb, struct ctx *a_ctx )
+{
+	size_t result = fread( a_ptr, 1, a_nmemb, a_ctx->file );
+	SHA1_Update( &a_ctx->sha_ctx, a_ptr, result );
+	a_ctx->file_pos += result;
+	return result;
+}
+
+
+long seek( struct ctx *a_ctx, long a_offset )
+{
+	assert( a_offset >= 0 );
+
+	char buffer[4096];
+	size_t read = 4096;
+	long remain = a_offset;
+
+	while (remain >= 4096 && read == 4096) {
+		read = c_fread( buffer, 4096, a_ctx );
+		remain -= read;
 	}
-	if (a_offset) {
-		a_ctx->file_pos += fread( buffer, 1, a_offset, a_ctx->file );
-		SHA1_Update( &a_ctx->sha_ctx, buffer, a_offset );
+
+	if (remain && read == 4096) {
+		read = c_fread( buffer, remain, a_ctx );
+		remain -= read;
 	}
+
+	return a_offset - remain;
 }
 
 
@@ -91,9 +117,8 @@ ssize_t read_offset_delta( struct ctx * a_ctx )
 	size_t byte_count = 0;
 
 	do {
-		next_char = fgetc( a_ctx->file );
+		next_char = c_fgetc( a_ctx );
 		buffer = next_char;
-		SHA1_Update( &a_ctx->sha_ctx, &buffer, 1 );
 		offset = (offset << 7) | (buffer & 0x7F);
 		byte_count++;
 	} while (next_char & 0x80);
@@ -136,14 +161,8 @@ ssize_t alloc_string( int a_char, struct ctx * a_ctx, char ** a_string )
 		}
 
 		if (buffer) {
-			next_char = fgetc( a_ctx->file );
+			next_char = c_fgetc( a_ctx );
 			if (next_char == a_char) {
-				if (a_char == EOF) {
-					SHA1_Update( &a_ctx->sha_ctx, buffer, buf_used );
-				} else {
-					buffer[buf_used] = next_char;
-					SHA1_Update( &a_ctx->sha_ctx, buffer, buf_used + 1 );
-				}
 				buffer[buf_used++] = 0;
 			} else if (next_char < 0) { // EOF
 				fprintf( stderr, "Unexpected end of file while scanning string.\n" );
@@ -180,16 +199,12 @@ void print_hex_string( size_t a_len, const void *a_ptr )
 // Allocates a_tree->path
 void parse_tree_entry( struct ctx *a_ctx, struct tree * a_tree )
 {
-		ssize_t result;
 		char *entry_count;
 		char *subtrees;
 
-		result = alloc_string( '\0', a_ctx, &a_tree->path );
-		a_ctx->file_pos += result + 1;
-		result = alloc_string( ' ', a_ctx, &entry_count );
-		a_ctx->file_pos += result + 1;
-		result = alloc_string( '\n', a_ctx, &subtrees );
-		a_ctx->file_pos += result + 1;
+		alloc_string( '\0', a_ctx, &a_tree->path );
+		alloc_string( ' ', a_ctx, &entry_count );
+		alloc_string( '\n', a_ctx, &subtrees );
 
 		a_tree->entry_count = atoi( entry_count );
 		a_tree->subtrees = atoi( subtrees );
@@ -198,9 +213,7 @@ void parse_tree_entry( struct ctx *a_ctx, struct tree * a_tree )
 		free( subtrees );
 
 		if (a_tree->entry_count >= 0) {
-			result = fread( a_tree->sha1, 1, 20, a_ctx->file );
-			a_ctx->file_pos += result;
-			SHA1_Update( &a_ctx->sha_ctx, a_tree->sha1, result );
+			c_fread( a_tree->sha1, 20, a_ctx );
 		}
 }
 
@@ -313,14 +326,72 @@ void print_flags( uint16_t a_flags )
 	printf( "%c%c%c", a_flags & 0x8000 ? 'v' : '-', a_flags & 0x4000 ? 'x' : '-', merge );
 }
 
+void print_flags_long( uint16_t a_flags )
+{
+	bool is_first = true;
+	int merge = (a_flags >> 12) & 3;
+
+	if (a_flags & 0x8000) {
+		printf( "assume-valid" );
+		is_first = false;
+	}
+
+	if (a_flags & 0x4000) {
+		if (is_first) {
+			printf( ", " );
+			is_first = false;
+		}
+		printf( "extended" );
+	}
+
+	if (merge) {
+		if (is_first) printf( ", " );
+		switch (merge) {
+		case 1: printf( "merge_common_ancestor" ); break;
+		case 2: printf( "merge_ours" ); break;
+		case 3: printf( "merge_theirs" ); break;
+		}
+	}
+}
+
+void print_extended_flags( uint16_t a_flags )
+{
+	printf( "%c%c%c", a_flags & 0x8000 ? 'r' : '-', a_flags & 0x4000 ? 's' : '-', a_flags & 0x2000 ? 'i' : '-' );
+}
+
+
+void print_extended_flags_long( uint16_t a_flags )
+{
+	bool is_first = true;
+
+	if (a_flags & 0x8000) {
+		printf( "reserved" );
+		is_first = false;
+	}
+
+	if (a_flags & 0x4000) {
+		if (is_first) {
+			printf( ", " );
+			is_first = false;
+		}
+		printf( "skip-worktree" );
+	}
+
+	if (a_flags & 0x4000) {
+		if (is_first) {
+			printf( ", " );
+			is_first = false;
+		}
+		printf( "intent-to-add" );
+	}
+}
+
 
 // Allocates entry->file_name
 int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 {
-	size_t result = fread( entry, 1, 62, a_ctx->file );
+	size_t result = c_fread( entry, 62, a_ctx );
 	if (result == 62) {
-		SHA1_Update( &a_ctx->sha_ctx, entry, 62 );
-		a_ctx->file_pos += result;
 		entry->ctime = ntohl( entry->ctime );
 		entry->ctime_ns = ntohl( entry->ctime_ns );
 		entry->mtime = ntohl( entry->mtime );
@@ -334,8 +405,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 		entry->flags = ntohs( entry->flags );
 
 		if (a_ctx->version >=3 && (entry->flags & 0x4000)) {
-			fread( &entry->extended_flags, 1, 2, a_ctx->file );
-			SHA1_Update( &a_ctx->sha_ctx, &entry->extended_flags, 2 );
+			c_fread( &entry->extended_flags, 2, a_ctx );
 			entry->extended_flags = ntohs( entry->extended_flags );
 		}
 
@@ -344,15 +414,12 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 		}
 
 		entry->file_name_len = alloc_string( '\0', a_ctx, &entry->file_name );
-		a_ctx->file_pos += entry->file_name_len + 1;
 
 		if (entry->file_name) {
-			long file_pos = a_ctx->file_pos;
-			if (a_ctx->version < 4 && file_pos % 8 != 4) {
-				entry->pad_bytes_len = 8 - ((file_pos - 4) % 8);
+			if (a_ctx->version < 4 && a_ctx->file_pos % 8 != 4) {
+				entry->pad_bytes_len = 8 - ((a_ctx->file_pos - 4) % 8);
 				entry->pad_bytes = malloc( entry->pad_bytes_len ); // XXX: allocate and read with entry->file_name
-				a_ctx->file_pos += fread( entry->pad_bytes, 1, entry->pad_bytes_len, a_ctx->file );
-				SHA1_Update( &a_ctx->sha_ctx, entry->pad_bytes, entry->pad_bytes_len );
+				c_fread( entry->pad_bytes, entry->pad_bytes_len, a_ctx );
 			} else {
 				entry->pad_bytes_len = 0; // It should be possible to do better…
 			}
@@ -375,6 +442,8 @@ int parse_index_stat( struct ctx * a_ctx )
 {
 	int result;
 	struct entry entry;
+	char *path_name = NULL;
+
 	for (int idx = 0; idx < a_ctx->entry_count; idx++) {
 		result = parse_index_entry( a_ctx, &entry );
 
@@ -383,18 +452,12 @@ int parse_index_stat( struct ctx * a_ctx )
 		time2str( ctimestr, entry.ctime, entry.ctime_ns );
 		time2str( mtimestr, entry.mtime, entry.mtime_ns );
 
-		const char *objtype = NULL;
-		switch ((entry.mode >> 12) & 0x0F) {
-		case 0x8: objtype = "regular file"; break;
-		case 0xA: objtype = "symbolic link"; break;
-		case 0xE: objtype = "gitlink"; break;
-		}
-
+		const char *obj_type = NULL;
 		char objtype_c = '?';
 		switch ((entry.mode >> 12) & 0x0F) {
-		case 0x8: objtype_c = '-'; break;
-		case 0xA: objtype_c = 'l'; break;
-		case 0xE: objtype_c = 'g'; break;
+		case 0x8: objtype_c = '-'; obj_type = "regular file"; break;
+		case 0xA: objtype_c = 'l'; obj_type = "symbolic link"; break;
+		case 0xE: objtype_c = 'g'; obj_type = "gitlink"; break;
 		}
 
 		struct passwd *user = getpwuid( entry.uid );
@@ -402,30 +465,40 @@ int parse_index_stat( struct ctx * a_ctx )
 
 		int col_width[] = {17, 0};
 		char dev_str[23];
-		char flag_str[30];
 		char ino_str[11];
 		char *user_str = malloc( user ? strlen( user->pw_name ) + 14 : 14 );
 
 		sprintf( dev_str, "%Xh/%ud", entry.dev, entry.dev );
-		sprintf( flag_str, "%s%sstage %u", (entry.flags & 0x8000) ? "assume-valid," : "", (entry.flags & 0x4000) ? "extended," : "", (entry.flags >> 12) & 3 );
 		sprintf( ino_str, "%u", entry.ino );
 		sprintf( user_str, "(%u/%s)", entry.uid, user ? user->pw_name : "" );
 
 		if (strlen( dev_str ) > col_width[0]) col_width[0] = strlen( dev_str );
-		if (strlen( flag_str ) - 7 > col_width[1]) col_width[1] = strlen( flag_str ) - 7;
+		if (strlen( obj_type ) - 7 > col_width[1]) col_width[1] = strlen( obj_type ) - 7;
 		if (strlen( ino_str ) > col_width[1]) col_width[1] = strlen( ino_str );
 		if (strlen( user_str ) > col_width[1]) col_width[1] = strlen( user_str );
 
 		printf( "Entry %u:\n", idx );
 		printf( "\t  File: " );
 		if (a_ctx->version >= 4) {
-			printf( "[%zu] ", entry.prefix );
+			if (!path_name) {
+				assert( entry.prefix == 0 ); // Should be an error check, not an assert.
+				path_name = strdup( entry.file_name );
+			} else {
+				assert( entry.prefix <= strlen( path_name ) ); // Should be an error check, not an assert.
+				path_name = realloc( path_name, strlen( path_name ) - entry.prefix + strlen( entry.file_name ) + 1 );
+				path_name[strlen( path_name ) - entry.prefix] = 0;
+				strcat( path_name, entry.file_name );
+			}
+			printf( "%s\n\t    ID: ", path_name );
+		} else {
+			printf( "%s\n\t    ID: ", entry.file_name );
 		}
-		printf( "%s\n\t    ID: ", entry.file_name );
 		print_hex_string( 20, entry.sha1 );
-		printf( "\n\t  Size: %-*u %-*s %s\n", col_width[0], entry.file_size, col_width[1] + 7, flag_str, objtype );
-		printf( "\tDevice: %-*s Inode: %-*s\n", col_width[0], dev_str, col_width[1], ino_str );
-		printf( "\tAccess: (%04o/%c", entry.mode & 0x0FFF, objtype_c );
+		printf( "\n\t  Size: %-*u %-*s ", col_width[0], entry.file_size, col_width[1] + 7, obj_type );
+		print_flags_long( entry.flags );
+		printf( "\n\tDevice: %-*s Inode: %-*s ", col_width[0], dev_str, col_width[1], ino_str );
+		print_extended_flags_long( entry.extended_flags );
+		printf( "\n\tAccess: (%04o/%c", entry.mode & 0x0FFF, objtype_c );
 		print_perm( (entry.mode >> 6) & 7 );
 		print_perm( (entry.mode >> 3) & 7 );
 		print_perm( entry.mode & 7 );
@@ -444,6 +517,9 @@ int parse_index_stat( struct ctx * a_ctx )
 		free( entry.file_name );
 		free( user_str );
 	}
+
+	if (path_name) free( path_name );
+
 	return result;
 }
 
@@ -500,6 +576,8 @@ int parse_index_ls( struct ctx * a_ctx )
 		if (strlen( buffer ) > size_width) size_width = strlen( buffer );
 	}
 
+	char *path_name = NULL;
+
 	for (idx = 0; idx < a_ctx->entry_count; idx++) {
 		entry_p = &entries[idx];
 
@@ -537,9 +615,26 @@ int parse_index_ls( struct ctx * a_ctx )
 		print_perm( entry_p->mode & 7 );
 		putchar( ' ' );
 		print_flags( entry_p->flags );
+		if (a_ctx->version >= 3) {
+			putchar( ' ' );
+			print_extended_flags( entry_p->extended_flags );
+		}
 		printf( " %*s %-*s %*u %s %s ", user_width, user_str, group_width, group_str, size_width, entry_p->file_size, ctimestr, mtimestr );
 		print_hex_string( 20, entry_p->sha1 );
-		printf( " %s\n", entry_p->file_name );
+		if (a_ctx->version >= 4) {
+			if (!path_name) {
+				assert( entry_p->prefix == 0 ); // Should be an error check, not an assert.
+				path_name = strdup( entry_p->file_name );
+			} else {
+				assert( entry_p->prefix <= strlen( path_name ) ); // Should be an error check, not an assert.
+				path_name = realloc( path_name, strlen( path_name ) - entry_p->prefix + strlen( entry_p->file_name ) + 1 );
+				path_name[strlen( path_name ) - entry_p->prefix] = 0;
+				strcat( path_name, entry_p->file_name );
+			}
+			printf( " %s\n", path_name );
+		} else {
+			printf( " %s\n", entry_p->file_name );
+		}
 
 		free( entry_p->file_name );
 	}
@@ -547,6 +642,7 @@ int parse_index_ls( struct ctx * a_ctx )
 	putchar( '\n' );
 
 	free( entries );
+	free( path_name );
 
 	return result;
 }
@@ -556,8 +652,7 @@ int parse_header( struct ctx * a_ctx )
 {
 	int result = 0;
 	struct header header;
-	a_ctx->file_pos += fread( &header, 1, 12, a_ctx->file );
-	SHA1_Update( &a_ctx->sha_ctx, &header, 12 );
+	c_fread( &header, 12, a_ctx );
 	a_ctx->version = ntohl( header.version );
 	a_ctx->entry_count = ntohl( header.entry_count );
 
@@ -600,7 +695,7 @@ int main( int argc, char * argv[] )
 
 	struct extension ext;
 
-	while (8 == fread( &ext, 1, 8, ctx.file )) {
+	while (8 == fread( &ext, 1, 8, ctx.file )) { // Can't use c_fread here as we might be reading the final SHA-1.
 		ctx.file_pos += 8;
 		ext.len = ntohl( ext.len );
 		long endpos = ctx.file_pos + ext.len;
@@ -652,19 +747,24 @@ int main( int argc, char * argv[] )
 				// Assume hash
 				unsigned char md[20];
 				SHA1_Final( md, &ctx.sha_ctx );
-				printf( "Computed hash: " );
-				print_hex_string( 20, md );
-				printf( "\n" );
-				ext.len = htonl( ext.len ); // Reverses the byte-swap
+
 				char hash[20];
+				ext.len = htonl( ext.len ); // Reverses the byte-swap
 				memcpy( hash, &ext, 8 );
 				result = fread( &hash[8], 1, 12, ctx.file );
+				ctx.file_pos += result;
 				if (result != 12) {
 					fprintf( stderr, "%d bytes read, 12 expected\n", result );
 				}
 				printf( "Hash checksum: " );
 				print_hex_string( 20, hash );
-				printf( "\n" );
+				if (memcmp( hash, md, 20)) {
+					printf( " (expected " );
+					print_hex_string( 20, md );
+					printf( ")\n" );
+				} else {
+					printf( " ✓\n" );
+				}
 			}
 		}
 	};
