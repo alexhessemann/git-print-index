@@ -66,42 +66,55 @@ struct ctx {
 };
 
 
+#if 0
+#pragma mark Utility methods
+#endif
+
+// Same as fgetc, but updates sha_ctx and file_pos.
 int c_fgetc( struct ctx *a_ctx )
 {
+	assert( a_ctx );
+
 	int result = fgetc( a_ctx->file );
+
 	if (result != EOF) {
 		char byte = result;
 		SHA1_Update( &a_ctx->sha_ctx, &byte, 1 );
 		a_ctx->file_pos++;
 	}
+
 	return result;
 }
 
 
+// Same as fread with the size element set to 1, but updates sha_ctx and file_pos.
 size_t c_fread( void *a_ptr, size_t a_nmemb, struct ctx *a_ctx )
 {
+	assert( a_ctx );
+
 	size_t result = fread( a_ptr, 1, a_nmemb, a_ctx->file );
 	SHA1_Update( &a_ctx->sha_ctx, a_ptr, result );
 	a_ctx->file_pos += result;
+
 	return result;
 }
 
 
+// Forward seek, roughly corresponding to fseek( a_ctx->file, a_offset, SEEK_CUR ) with a_offset ≥ 0.
+// Updates sha_ctx and file_pos.
+// Returns the effectively seeked amount, which might be less than a_offset in case of error / EOF.
 long seek( struct ctx *a_ctx, long a_offset )
 {
+	assert( a_ctx );
 	assert( a_offset >= 0 );
 
 	char buffer[4096];
 	size_t read = 4096;
 	long remain = a_offset;
 
-	while (remain >= 4096 && read == 4096) {
-		read = c_fread( buffer, 4096, a_ctx );
-		remain -= read;
-	}
-
-	if (remain && read == 4096) {
-		read = c_fread( buffer, remain, a_ctx );
+	// Allow short reads as long as we read at least one byte.
+	while (remain && read > 0) {
+		read = c_fread( buffer, remain < 4096 ? remain : 4096, a_ctx );
 		remain -= read;
 	}
 
@@ -109,31 +122,8 @@ long seek( struct ctx *a_ctx, long a_offset )
 }
 
 
-ssize_t read_offset_delta( struct ctx * a_ctx )
-{
-	ssize_t offset = 0;
-	int next_char;
-	uint8_t buffer;
-	size_t byte_count = 0;
-
-	do {
-		next_char = c_fgetc( a_ctx );
-		buffer = next_char;
-		offset = (offset << 7) | (buffer & 0x7F);
-		byte_count++;
-	} while (next_char & 0x80);
-
-	for (size_t pow7 = 0x80; --byte_count; pow7<<=7) {
-		offset += pow7;
-	}
-
-	return offset;
-}
-
-
 // Allocates a NUL-terminated string read from the file in context,
 // with the provided char as a terminator, which can be EOF.
-// SHA1 context is updated with the original terminator.
 // Returns:
 //	- string length as strlen would, not counting the final \0.
 //	- (-1) when growing the buffer fails, or EOF is reached unexpectedly.
@@ -188,11 +178,38 @@ ssize_t alloc_string( int a_char, struct ctx * a_ctx, char ** a_string )
 
 void print_hex_string( size_t a_len, const void *a_ptr )
 {
-	size_t len = a_len;
+	assert( a_ptr );
+
 	const uint8_t *ptr = (const uint8_t *) a_ptr;
-	while (len--) {
-		printf( "%02X", *ptr++ );
+
+	while (a_len--) printf( "%02X", *ptr++ );
+}
+
+
+// Implementation according to:
+//	https://kernel.org/pub/software/scm/git/docs/technical/pack-format.txt
+// (see OFS_DELTA, offset encoding).
+ssize_t read_offset_delta( struct ctx * a_ctx )
+{
+	assert( a_ctx );
+
+	ssize_t offset = 0;
+	int next_char;
+	uint8_t buffer;
+	size_t byte_count = 0;
+
+	do {
+		next_char = c_fgetc( a_ctx );
+		buffer = next_char;
+		offset = (offset << 7) | (buffer & 0x7F);
+		byte_count++;
+	} while (next_char & 0x80);
+
+	for (size_t pow7 = 0x80; --byte_count; pow7<<=7) {
+		offset += pow7;
 	}
+
+	return offset;
 }
 
 
@@ -337,15 +354,13 @@ void print_flags_long( uint16_t a_flags )
 	}
 
 	if (a_flags & 0x4000) {
-		if (is_first) {
-			printf( ", " );
-			is_first = false;
-		}
+		if (!is_first) printf( ", " );
 		printf( "extended" );
+		is_first = false;
 	}
 
 	if (merge) {
-		if (is_first) printf( ", " );
+		if (!is_first) printf( ", " );
 		switch (merge) {
 		case 1: printf( "merge_common_ancestor" ); break;
 		case 2: printf( "merge_ours" ); break;
@@ -370,19 +385,15 @@ void print_extended_flags_long( uint16_t a_flags )
 	}
 
 	if (a_flags & 0x4000) {
-		if (is_first) {
-			printf( ", " );
-			is_first = false;
-		}
+		if (!is_first) printf( ", " );
 		printf( "skip-worktree" );
+		is_first = false;
 	}
 
 	if (a_flags & 0x4000) {
-		if (is_first) {
-			printf( ", " );
-			is_first = false;
-		}
+		if (!is_first) printf( ", " );
 		printf( "intent-to-add" );
+		is_first = false;
 	}
 }
 
@@ -441,7 +452,7 @@ int parse_index_entry( struct ctx * a_ctx, struct entry *entry )
 int parse_index_stat( struct ctx * a_ctx )
 {
 	int result;
-	struct entry entry;
+	struct entry entry = { .extended_flags = 0 };
 	char *path_name = NULL;
 
 	for (int idx = 0; idx < a_ctx->entry_count; idx++) {
@@ -477,16 +488,17 @@ int parse_index_stat( struct ctx * a_ctx )
 		if (strlen( ino_str ) > col_width[1]) col_width[1] = strlen( ino_str );
 		if (strlen( user_str ) > col_width[1]) col_width[1] = strlen( user_str );
 
-		printf( "Entry %u:\n", idx );
+		printf( "Entry %u:\n", idx+1 );
 		printf( "\t  File: " );
 		if (a_ctx->version >= 4) {
 			if (!path_name) {
 				assert( entry.prefix == 0 ); // Should be an error check, not an assert.
 				path_name = strdup( entry.file_name );
 			} else {
-				assert( entry.prefix <= strlen( path_name ) ); // Should be an error check, not an assert.
-				path_name = realloc( path_name, strlen( path_name ) - entry.prefix + strlen( entry.file_name ) + 1 );
-				path_name[strlen( path_name ) - entry.prefix] = 0;
+				size_t old_len = strlen( path_name );
+				assert( entry.prefix <= old_len ); // Should be an error check, not an assert.
+				path_name = realloc( path_name, old_len - entry.prefix + strlen( entry.file_name ) + 1 );
+				path_name[old_len - entry.prefix] = 0;
 				strcat( path_name, entry.file_name );
 			}
 			printf( "%s\n\t    ID: ", path_name );
@@ -660,7 +672,7 @@ int parse_header( struct ctx * a_ctx )
 		fprintf( stderr, "Not a git index file.\n" );
 		result = 1;
 	} else {
-		printf( "Version %u, entry count %u\n\n", a_ctx->version, a_ctx->entry_count );
+		printf( "git index version %u\n\nEntry count: %u\n\n", a_ctx->version, a_ctx->entry_count );
 	}
 
 	return result;
