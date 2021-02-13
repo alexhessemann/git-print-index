@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <grp.h>
+#include <limits.h>
 #include <openssl/sha.h>
 #include <pwd.h>
 #include <stdbool.h>
@@ -10,6 +11,19 @@
 #include <string.h>
 #include <time.h>
 
+
+#if 0
+#pragma mark Globals
+#endif
+
+// These are set once during initialisation and act as constants
+static const size_t g_max_offset_delta_len = (8 * sizeof( ssize_t ) - 1 + 6) / 7;
+static ssize_t g_max_offset_delta;
+
+
+#if 0
+#pragma mark Structures
+#endif
 
 struct header {
 	char signature[4];
@@ -124,9 +138,10 @@ long seek( struct ctx *a_ctx, long a_offset )
 
 // Allocates a NUL-terminated string read from the file in context,
 // with the provided char as a terminator, which can be EOF.
+// Updates sha_ctx and file_pos.
 // Returns:
 //	- string length as strlen would, not counting the final \0.
-//	- (-1) when growing the buffer fails, or EOF is reached unexpectedly.
+//	- (-1) when growing the buffer fails, or EOF is reached unexpectedly, in which case *a_string is set to NULL.
 ssize_t alloc_string( int a_char, struct ctx * a_ctx, char ** a_string )
 {
 	assert( a_char == EOF || (a_char >=0 && a_char <= 255) );
@@ -139,7 +154,6 @@ ssize_t alloc_string( int a_char, struct ctx * a_ctx, char ** a_string )
 	int next_char;
 
 	do {
-		// Grow the buffer if needed
 		if (buf_used >= buf_len) {
 			buf_len += 4096;
 			char *upd_buffer = realloc( buffer, buf_len );
@@ -189,6 +203,13 @@ void print_hex_string( size_t a_len, const void *a_ptr )
 // Implementation according to:
 //	https://kernel.org/pub/software/scm/git/docs/technical/pack-format.txt
 // (see OFS_DELTA, offset encoding).
+//
+// Warn if an overflow occured.
+//
+// Returns:
+// - a positive value corresponding to the decoded integer on success
+// - (-1) if a read error occured.
+// - other negative vales are possible on overflow
 ssize_t read_offset_delta( struct ctx * a_ctx )
 {
 	assert( a_ctx );
@@ -196,17 +217,41 @@ ssize_t read_offset_delta( struct ctx * a_ctx )
 	ssize_t offset = 0;
 	int next_char;
 	uint8_t buffer;
+	uint8_t first_char = 0;
 	size_t byte_count = 0;
 
 	do {
 		next_char = c_fgetc( a_ctx );
-		buffer = next_char;
-		offset = (offset << 7) | (buffer & 0x7F);
-		byte_count++;
-	} while (next_char & 0x80);
+		if (next_char != EOF) {
+			buffer = next_char;
+			if (!first_char) first_char = buffer;
+			offset = (offset << 7) | (buffer & 0x7F);
+			byte_count++;
+		}
+	} while (next_char != EOF && (next_char & 0x80));
 
-	for (size_t pow7 = 0x80; --byte_count; pow7<<=7) {
-		offset += pow7;
+	if (next_char != EOF) {
+		if (byte_count > g_max_offset_delta_len) {
+			fprintf( stderr, "Encoded offset overflow.\n" );
+		} else if (byte_count == g_max_offset_delta_len) {
+			// We need to check first_char to ensure no set bits have been lost while shifting
+			int bits = byte_count * 7 - (sizeof( ssize_t ) * 8 - 1);
+			uint8_t mask = ((1 << bits) - 1) << (7-bits);
+			if (first_char & mask) {
+				fprintf( stderr, "Encoded offset overflow.\n" );
+			}
+		}
+
+		for (size_t pow7 = 0x80; --byte_count; pow7<<=7) {
+			offset += pow7;
+		}
+
+		if (offset < 0) {
+			fprintf( stderr, "Encoded offset overflow.\n" );
+		}
+	} else {
+		fprintf( stderr, "Unexpected end of file while scanning encoded offset\n" );
+		offset = -1;
 	}
 
 	return offset;
@@ -214,24 +259,36 @@ ssize_t read_offset_delta( struct ctx * a_ctx )
 
 
 // Allocates a_tree->path
-void parse_tree_entry( struct ctx *a_ctx, struct tree * a_tree )
+ssize_t parse_tree_entry( struct ctx *a_ctx, struct tree * a_tree )
 {
-		char *entry_count;
-		char *subtrees;
+	ssize_t result;
+	char *entry_count;
+	char *subtrees;
+	char *end_ptr;
 
-		alloc_string( '\0', a_ctx, &a_tree->path );
-		alloc_string( ' ', a_ctx, &entry_count );
-		alloc_string( '\n', a_ctx, &subtrees );
+	result = alloc_string( '\0', a_ctx, &a_tree->path );
+	if (result == -1) goto pte_exit1;
+	result = alloc_string( ' ', a_ctx, &entry_count );
+	if (result == -1) goto pte_exit1;
+	result = alloc_string( '\n', a_ctx, &subtrees );
+	if (result == -1) goto pte_exit2;
 
-		a_tree->entry_count = atoi( entry_count );
-		a_tree->subtrees = atoi( subtrees );
+	a_tree->entry_count = strtoul( entry_count, &end_ptr, 10 );
+	a_tree->subtrees = strtoul( subtrees, &end_ptr, 10 );
 
-		free( entry_count );
-		free( subtrees );
+	free( entry_count );
+	free( subtrees );
 
-		if (a_tree->entry_count >= 0) {
-			c_fread( a_tree->sha1, 20, a_ctx );
-		}
+	if (a_tree->entry_count >= 0) {
+		result = c_fread( a_tree->sha1, 20, a_ctx );
+	}
+
+	return result;
+
+pte_exit2:
+	free( entry_count );
+pte_exit1:
+	return result;
 }
 
 
@@ -478,6 +535,7 @@ int parse_index_stat( struct ctx * a_ctx )
 		char dev_str[23];
 		char ino_str[11];
 		char *user_str = malloc( user ? strlen( user->pw_name ) + 14 : 14 );
+		size_t old_len;
 
 		sprintf( dev_str, "%Xh/%ud", entry.dev, entry.dev );
 		sprintf( ino_str, "%u", entry.ino );
@@ -495,7 +553,7 @@ int parse_index_stat( struct ctx * a_ctx )
 				assert( entry.prefix == 0 ); // Should be an error check, not an assert.
 				path_name = strdup( entry.file_name );
 			} else {
-				size_t old_len = strlen( path_name );
+				old_len = strlen( path_name );
 				assert( entry.prefix <= old_len ); // Should be an error check, not an assert.
 				path_name = realloc( path_name, old_len - entry.prefix + strlen( entry.file_name ) + 1 );
 				path_name[old_len - entry.prefix] = 0;
@@ -521,8 +579,10 @@ int parse_index_stat( struct ctx * a_ctx )
 		if (entry.mode & 0xFFFF0000) {
 			printf( "\tMode: 0x%08X\n", entry.mode );
 		}
-		if (entry.file_name_len != (entry.flags & 0x0FFF)) {
+		if (a_ctx->version <= 3 && entry.file_name_len != (entry.flags & 0x0FFF)) {
 			printf("\tFilename length declared (%u) is different from the one computed (%zu)\n", entry.flags & 0x0FFF, entry.file_name_len );
+		} else if (a_ctx->version >= 4 && old_len - entry.prefix + entry.file_name_len != (entry.flags & 0x0FFF)) {
+			printf("\tFilename length declared (%u) is different from the one computed (%zu)\n", entry.flags & 0x0FFF, old_len - entry.prefix + entry.file_name_len );
 		}
 		printf( "\n" );
 
@@ -679,6 +739,24 @@ int parse_header( struct ctx * a_ctx )
 }
 
 
+void init_constants()
+{
+	size_t pow7 = 0x80;
+	ssize_t max_val = SSIZE_MAX;
+
+//	printf( "SSIZE_MAX = %zd (0x%zX), max_len = %zu, ", max_val, max_val, g_max_offset_delta_len );
+
+	do {
+		max_val -= pow7;
+		pow7<<=7;
+	} while (pow7 && pow7 < max_val);
+
+	g_max_offset_delta = max_val;
+
+//	printf( "max_val = %zd (0x%zX)\n", max_val, max_val );
+}
+
+
 int main( int argc, char * argv[] )
 {
 	struct ctx ctx = { .file = NULL, .file_pos = 0, .version = 0, .entry_count = 0 };
@@ -694,6 +772,7 @@ int main( int argc, char * argv[] )
 		}
 	}
 
+	init_constants();
 	SHA1_Init( &ctx.sha_ctx );
 
 	result = parse_header( &ctx );
